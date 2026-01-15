@@ -424,6 +424,10 @@ pub struct PutRequestsMetrics {
     pub pmem_count: SharedIncMetric,
     /// Number of failures in attaching a pmem device.
     pub pmem_fails: SharedIncMetric,
+    /// Number of PUTs triggering an RDMA attach.
+    pub rdma_count: SharedIncMetric,
+    /// Number of failures in attaching an RDMA device.
+    pub rdma_fails: SharedIncMetric,
     /// Number of PUTs to /serial
     pub serial_count: SharedIncMetric,
     /// Number of failed PUTs to /serial
@@ -459,6 +463,8 @@ impl PutRequestsMetrics {
             vsock_fails: SharedIncMetric::new(),
             pmem_count: SharedIncMetric::new(),
             pmem_fails: SharedIncMetric::new(),
+            rdma_count: SharedIncMetric::new(),
+            rdma_fails: SharedIncMetric::new(),
             serial_count: SharedIncMetric::new(),
             serial_fails: SharedIncMetric::new(),
             hotplug_memory_count: SharedIncMetric::new(),

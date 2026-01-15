@@ -596,6 +596,36 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /rdma-devices/{id}:
+    put:
+      summary: Creates an RDMA device. Pre-boot only.
+      description:
+        Creates a new RDMA device with ID specified by id path parameter.
+      operationId: putRdmaDeviceByID
+      parameters:
+        - name: id
+          in: path
+          description: The id of the RDMA device
+          required: true
+          type: string
+        - name: body
+          in: body
+          description: Guest RDMA device properties
+          required: true
+          schema:
+            $ref: "#/definitions/RdmaDevice"
+      responses:
+        204:
+          description: RDMA device created/updated
+        400:
+          description: RDMA device cannot be created due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /serial:
     put:
       summary: Configures the serial console
@@ -1256,6 +1286,16 @@ definitions:
         description:
           Flag to map backing file in read-only mode.
 
+  RdmaDevice:
+    type: object
+    required:
+      - id
+    properties:
+      id:
+        type: string
+        description:
+          Identificator for this device.
+
   Error:
     type: object
     properties:
@@ -1293,6 +1333,11 @@ definitions:
         description: Configurations for all net devices.
         items:
           $ref: "#/definitions/NetworkInterface"
+      rdma-devices:
+        type: array
+        description: Configurations for all RDMA devices.
+        items:
+          $ref: "#/definitions/RdmaDevice"
       pmem:
         type: array
         description: Configurations for all pmem devices.

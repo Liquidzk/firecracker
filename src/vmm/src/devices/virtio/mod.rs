@@ -23,6 +23,7 @@ pub mod net;
 pub mod persist;
 pub mod pmem;
 pub mod queue;
+pub mod rdma;
 pub mod rng;
 pub mod test_utils;
 pub mod transport;

@@ -29,6 +29,7 @@ use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
 use crate::vmm_config::pmem::{PmemBuilder, PmemConfig, PmemConfigError};
+use crate::vmm_config::rdma::{RdmaDeviceBuilder, RdmaDeviceConfig, RdmaDeviceError};
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::vsock::*;
 use crate::vstate::memory;
@@ -65,6 +66,8 @@ pub enum ResourcesError {
     EntropyDevice(#[from] EntropyDeviceError),
     /// Pmem device error: {0}
     PmemDevice(#[from] PmemConfigError),
+    /// RDMA device error: {0}
+    RdmaDevice(#[from] RdmaDeviceError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
 }
@@ -90,6 +93,8 @@ pub struct VmmConfig {
     mmds_config: Option<MmdsConfig>,
     #[serde(default)]
     network_interfaces: Vec<NetworkInterfaceConfig>,
+    #[serde(default)]
+    rdma_devices: Vec<RdmaDeviceConfig>,
     vsock: Option<VsockDeviceConfig>,
     entropy: Option<EntropyDeviceConfig>,
     #[serde(default, rename = "pmem")]
@@ -119,6 +124,8 @@ pub struct VmResources {
     pub entropy: EntropyDeviceBuilder,
     /// The pmem devices.
     pub pmem: PmemBuilder,
+    /// The RDMA devices.
+    pub rdma: RdmaDeviceBuilder,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
     /// The optional Mmds data store.
@@ -184,6 +191,10 @@ impl VmResources {
 
         for net_config in vmm_config.network_interfaces.into_iter() {
             resources.build_net_device(net_config)?;
+        }
+
+        for rdma_config in vmm_config.rdma_devices.into_iter() {
+            resources.build_rdma_device(rdma_config)?;
         }
 
         if let Some(vsock_config) = vmm_config.vsock {
@@ -377,6 +388,14 @@ impl VmResources {
         self.pmem.build(body, has_block_root)
     }
 
+    /// Builds an RDMA device to be attached when the VM starts.
+    pub fn build_rdma_device(
+        &mut self,
+        body: RdmaDeviceConfig,
+    ) -> Result<(), RdmaDeviceError> {
+        self.rdma.insert(body)
+    }
+
     /// Sets the memory hotplug configuration.
     pub fn set_memory_hotplug_config(
         &mut self,
@@ -530,6 +549,7 @@ impl From<&VmResources> for VmmConfig {
             metrics: None,
             mmds_config: resources.mmds_config(),
             network_interfaces: resources.net_builder.configs(),
+            rdma_devices: resources.rdma.configs(),
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
             pmem_devices: resources.pmem.configs(),

@@ -353,6 +353,9 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                         device_info,
                     });
                 }
+                VirtioDeviceType::Rdma => {
+                    warn!("Skipping rdma device. Snapshotting is not supported yet");
+                }
             };
 
             Ok(())

@@ -421,6 +421,9 @@ impl<'a> Persist<'a> for PciDevices {
                         transport_state,
                     })
                 }
+                VirtioDeviceType::Rdma => {
+                    warn!("Skipping rdma device. Snapshotting is not supported yet");
+                }
             }
         }
 
