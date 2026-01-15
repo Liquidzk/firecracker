@@ -1,0 +1,46 @@
+RDMA API + virtio stub (M0/M1) change log
+
+Summary
+- Added an RDMA device API endpoint and schema and wired it into /vm/config.
+- Added VMM resource storage and pre-boot VmmAction handling for RDMA devices.
+- Implemented a minimal virtio-rdma stub device (1 queue, no features) and attached it in the VMM builder.
+- Updated snapshot persistence to skip RDMA devices for now.
+- Extended metrics definitions for RDMA PUT requests and updated test schema list.
+
+Details by area
+- Swagger/API:
+  - Added PUT /rdma-devices/{id} with RdmaDevice schema.
+  - Added rdma-devices field to FullVmConfiguration.
+  - Files: src/firecracker/swagger/firecracker.yaml
+- API parsing + metrics:
+  - Added request handler for PUT /rdma-devices/{id}.
+  - Added RDMA PUT metrics counters.
+  - Files: src/firecracker/src/api_server/request/rdma.rs
+          src/firecracker/src/api_server/parsed_request.rs
+          src/firecracker/src/api_server/request/mod.rs
+          src/vmm/src/logger/metrics.rs
+          tests/host_tools/fcmetrics.py
+- VMM config/resources:
+  - Added RdmaDeviceConfig and RdmaDeviceBuilder.
+  - Stored rdma_devices in VmmConfig and exposed via /vm/config.
+  - Added VmmAction::InsertRdmaDevice and wired it into pre-boot handling.
+  - Files: src/vmm/src/vmm_config/rdma.rs
+          src/vmm/src/vmm_config/mod.rs
+          src/vmm/src/resources.rs
+          src/vmm/src/rpc_interface.rs
+- Virtio stub device:
+  - Added VirtioRdma device with 1 queue, features=0, no command handling.
+  - Hooked into event loop with minimal queue event handling.
+  - Attached in builder if rdma_devices is configured.
+  - Added VirtioDeviceType::Rdma (id 42).
+  - Files: src/vmm/src/devices/virtio/rdma/mod.rs
+          src/vmm/src/devices/virtio/rdma/device.rs
+          src/vmm/src/devices/virtio/rdma/event_handler.rs
+          src/vmm/src/devices/virtio/mod.rs
+          src/vmm/src/devices/virtio/device.rs
+          src/vmm/src/builder.rs
+- Snapshotting:
+  - Skips RDMA device state in MMIO/PCI persistence for now.
+  - Files: src/vmm/src/device_manager/persist.rs
+          src/vmm/src/device_manager/pci_mngr.rs
+

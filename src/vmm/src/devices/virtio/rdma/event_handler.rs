@@ -48,11 +48,6 @@ impl VirtioRdma {
         }
     }
 
-    fn process_queue_event(&mut self) {
-        if let Err(err) = self.queue_events()[RDMA_QUEUE].read() {
-            error!("rdma: Failed to read queue event: {err}");
-        }
-    }
 }
 
 impl MutEventSubscriber for VirtioRdma {
