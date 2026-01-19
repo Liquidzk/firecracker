@@ -1,0 +1,1 @@
+cmd_/home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/modules.order := {   echo /home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/virtio_rdma.ko; :; } > /home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/modules.order

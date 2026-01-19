@@ -1,0 +1,1 @@
+cmd_/home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/virtio_rdma.mod := printf '%s\n'   virtio_rdma.o | awk '!x[$$0]++ { print("/home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/"$$0) }' > /home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/virtio_rdma.mod

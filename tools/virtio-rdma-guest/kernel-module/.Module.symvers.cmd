@@ -1,0 +1,1 @@
+cmd_/home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/Module.symvers :=  sed 's/ko$$/o/'  /home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/modules.order | scripts/mod/modpost       -o /home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/Module.symvers -e -i Module.symvers -T - 

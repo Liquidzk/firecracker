@@ -11,6 +11,7 @@ use vmm_sys_util::eventfd::EventFd;
 use super::RDMA_NUM_QUEUES;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::queue::{
     DescriptorChain, FIRECRACKER_MAX_QUEUE_SIZE, InvalidAvailIdx, Queue, QueueError,
 };
@@ -88,7 +89,7 @@ impl VirtioRdma {
 
         Ok(Self {
             id,
-            avail_features: 0,
+            avail_features: 1u64 << VIRTIO_F_VERSION_1,
             acked_features: 0,
             activate_event,
             device_state: DeviceState::Inactive,
