@@ -4,6 +4,16 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
 KERNEL_DIR="${KERNEL_DIR:-}"
 
+for arg in "$@"; do
+  case "$arg" in
+    KERNEL_DIR=*)
+      KERNEL_DIR="${arg#KERNEL_DIR=}"
+      ;;
+    *)
+      ;;
+  esac
+done
+
 if [[ -z "$KERNEL_DIR" ]]; then
   echo "KERNEL_DIR is required (path to guest kernel source/build tree)." >&2
   exit 1

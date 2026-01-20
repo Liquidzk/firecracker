@@ -1,6 +1,7 @@
 // Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
 use std::io;
 use std::mem::size_of;
 use std::ops::Deref;
@@ -19,7 +20,7 @@ use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::impl_device_type;
 use crate::logger::{error, info};
 use crate::vstate::memory::{ByteValued, Bytes, GuestMemoryMmap};
-use vm_memory::GuestMemoryError;
+use vm_memory::{GuestAddress, GuestMemoryError};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum RdmaError {
@@ -46,14 +47,29 @@ enum RdmaQueueError {
 }
 
 const RDMA_OPCODE_CREATE_QP: u32 = 1;
+const RDMA_OPCODE_QUERY_CAPS: u32 = 2;
+const RDMA_OPCODE_REGISTER_MR: u32 = 3;
+const RDMA_OPCODE_POST_SEND: u32 = 4;
+const RDMA_OPCODE_POST_RECV: u32 = 5;
+const RDMA_OPCODE_POLL_CQ: u32 = 6;
+const RDMA_OPCODE_DESTROY_QP: u32 = 7;
+const RDMA_OPCODE_DEREGISTER_MR: u32 = 8;
+
 const RDMA_STATUS_OK: u32 = 0;
 const RDMA_STATUS_ERR: u32 = 1;
+const RDMA_STATUS_EMPTY: u32 = 2;
 
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(C)]
 struct RdmaRequest {
+    addr: u64,
+    wr_id: u64,
     opcode: u32,
     qp_id: u32,
+    mr_id: u32,
+    len: u32,
+    flags: u32,
+    reserved: u32,
 }
 
 // SAFETY: RdmaRequest contains only PODs in repr(C) without padding.
@@ -62,11 +78,53 @@ unsafe impl ByteValued for RdmaRequest {}
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(C)]
 struct RdmaResponse {
+    wr_id: u64,
     status: u32,
+    opcode: u32,
+    bytes: u32,
+    value0: u32,
+    value1: u32,
+    value2: u32,
+    value3: u32,
+    value4: u32,
 }
 
 // SAFETY: RdmaResponse contains only PODs in repr(C) without padding.
 unsafe impl ByteValued for RdmaResponse {}
+
+#[derive(Debug, Clone, Copy)]
+struct RdmaCaps {
+    version_major: u32,
+    version_minor: u32,
+    max_qp: u32,
+    max_mr: u32,
+    max_cq: u32,
+    max_wr: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RdmaMr {
+    id: u32,
+    addr: u64,
+    len: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RdmaWr {
+    qp_id: u32,
+    mr_id: u32,
+    addr: u64,
+    len: u32,
+    wr_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RdmaCqe {
+    wr_id: u64,
+    status: u32,
+    bytes: u32,
+    opcode: u32,
+}
 
 #[derive(Debug)]
 pub struct VirtioRdma {
@@ -77,6 +135,13 @@ pub struct VirtioRdma {
     device_state: DeviceState,
     queues: Vec<Queue>,
     queue_events: Vec<EventFd>,
+    caps: RdmaCaps,
+    next_mr_id: u32,
+    mrs: Vec<RdmaMr>,
+    pending_sends: VecDeque<RdmaWr>,
+    pending_recvs: VecDeque<RdmaWr>,
+    cq: VecDeque<RdmaCqe>,
+    has_qp: bool,
 }
 
 impl VirtioRdma {
@@ -95,6 +160,20 @@ impl VirtioRdma {
             device_state: DeviceState::Inactive,
             queues,
             queue_events,
+            caps: RdmaCaps {
+                version_major: 1,
+                version_minor: 0,
+                max_qp: 1,
+                max_mr: 16,
+                max_cq: 1,
+                max_wr: 128,
+            },
+            next_mr_id: 1,
+            mrs: Vec::new(),
+            pending_sends: VecDeque::new(),
+            pending_recvs: VecDeque::new(),
+            cq: VecDeque::new(),
+            has_qp: false,
         })
     }
 
@@ -149,7 +228,7 @@ impl VirtioRdma {
     }
 
     fn process_chain(
-        &self,
+        &mut self,
         active_state: &ActiveState,
         head: DescriptorChain,
     ) -> Result<u32, RdmaQueueError> {
@@ -163,6 +242,10 @@ impl VirtioRdma {
         let request: RdmaRequest = active_state.mem.read_obj(head.addr)?;
         let opcode = u32::from_le(request.opcode);
         let qp_id = u32::from_le(request.qp_id);
+        let mr_id = u32::from_le(request.mr_id);
+        let len = u32::from_le(request.len);
+        let addr = u64::from_le(request.addr);
+        let wr_id = u64::from_le(request.wr_id);
 
         let Some(resp_desc) = head.next_descriptor() else {
             return Err(RdmaQueueError::DescriptorChainTooShort);
@@ -174,19 +257,204 @@ impl VirtioRdma {
             return Err(RdmaQueueError::DescriptorTooShort);
         }
 
-        let status = if opcode == RDMA_OPCODE_CREATE_QP {
-            info!("virtio-rdma: CREATE_QP qp_id={qp_id}");
-            RDMA_STATUS_OK
-        } else {
-            RDMA_STATUS_ERR
+        let mut response = RdmaResponse {
+            wr_id: wr_id.to_le(),
+            status: RDMA_STATUS_OK.to_le(),
+            opcode: opcode.to_le(),
+            bytes: 0,
+            value0: 0,
+            value1: 0,
+            value2: 0,
+            value3: 0,
+            value4: 0,
         };
 
-        let response = RdmaResponse {
-            status: status.to_le(),
-        };
+        match opcode {
+            RDMA_OPCODE_CREATE_QP => {
+                info!("virtio-rdma: CREATE_QP qp_id={qp_id}");
+                self.has_qp = true;
+            }
+            RDMA_OPCODE_QUERY_CAPS => {
+                info!("virtio-rdma: QUERY_CAPS");
+                response.value0 = self.caps.version_major.to_le();
+                response.value1 = self.caps.version_minor.to_le();
+                response.value2 = self.caps.max_qp.to_le();
+                response.value3 = self.caps.max_mr.to_le();
+                response.bytes = self.caps.max_cq.to_le();
+                response.value4 = self.caps.max_wr.to_le();
+            }
+            RDMA_OPCODE_REGISTER_MR => {
+                let assigned = if mr_id == 0 {
+                    let id = self.next_mr_id;
+                    self.next_mr_id = self.next_mr_id.saturating_add(1);
+                    id
+                } else if self.mrs.iter().any(|mr| mr.id == mr_id) {
+                    0
+                } else {
+                    mr_id
+                };
+
+                if assigned == 0 {
+                    response.status = RDMA_STATUS_ERR.to_le();
+                } else {
+                    self.mrs.push(RdmaMr {
+                        id: assigned,
+                        addr,
+                        len,
+                    });
+                    response.value0 = assigned.to_le();
+                    response.opcode = RDMA_OPCODE_REGISTER_MR.to_le();
+                    info!(
+                        "virtio-rdma: REGISTER_MR id={assigned} addr=0x{addr:x} len={len}"
+                    );
+                }
+            }
+            RDMA_OPCODE_POST_SEND | RDMA_OPCODE_POST_RECV => {
+                let is_send = opcode == RDMA_OPCODE_POST_SEND;
+                let status = self.enqueue_wr(active_state, is_send, qp_id, mr_id, addr, len, wr_id);
+                if status != RDMA_STATUS_OK {
+                    response.status = status.to_le();
+                }
+                response.opcode = opcode.to_le();
+            }
+            RDMA_OPCODE_POLL_CQ => {
+                if let Some(cqe) = self.cq.pop_front() {
+                    response.wr_id = cqe.wr_id.to_le();
+                    response.status = cqe.status.to_le();
+                    response.bytes = cqe.bytes.to_le();
+                    response.opcode = cqe.opcode.to_le();
+                } else {
+                    response.status = RDMA_STATUS_EMPTY.to_le();
+                }
+            }
+            RDMA_OPCODE_DESTROY_QP => {
+                info!("virtio-rdma: DESTROY_QP qp_id={qp_id}");
+                self.has_qp = false;
+                self.pending_sends.clear();
+                self.pending_recvs.clear();
+                self.cq.clear();
+            }
+            RDMA_OPCODE_DEREGISTER_MR => {
+                let count = self.mrs.len();
+                self.mrs.retain(|mr| mr.id != mr_id);
+                if self.mrs.len() == count {
+                    info!("virtio-rdma: DEREGISTER_MR id={mr_id} (not found)");
+                } else {
+                    info!("virtio-rdma: DEREGISTER_MR id={mr_id}");
+                }
+            }
+            _ => {
+                response.status = RDMA_STATUS_ERR.to_le();
+            }
+        }
+
         active_state.mem.write_obj(response, resp_desc.addr)?;
 
         Ok(size_of::<RdmaResponse>() as u32)
+    }
+
+    fn enqueue_wr(
+        &mut self,
+        active_state: &ActiveState,
+        is_send: bool,
+        qp_id: u32,
+        mr_id: u32,
+        addr: u64,
+        len: u32,
+        wr_id: u64,
+    ) -> u32 {
+        if !self.has_qp {
+            return RDMA_STATUS_ERR;
+        }
+
+        let mr = match self.mrs.iter().find(|mr| mr.id == mr_id) {
+            Some(mr) => mr,
+            None => return RDMA_STATUS_ERR,
+        };
+
+        let effective_addr = if addr == 0 { mr.addr } else { addr };
+        let effective_len = if len == 0 { mr.len } else { len.min(mr.len) };
+
+        let wr = RdmaWr {
+            qp_id,
+            mr_id,
+            addr: effective_addr,
+            len: effective_len,
+            wr_id,
+        };
+
+        if (self.pending_sends.len() + self.pending_recvs.len()) >= self.caps.max_wr as usize {
+            return RDMA_STATUS_ERR;
+        }
+
+        if is_send {
+            info!(
+                "virtio-rdma: POST_SEND qp_id={qp_id} mr_id={mr_id} len={effective_len}"
+            );
+            self.pending_sends.push_back(wr);
+        } else {
+            info!(
+                "virtio-rdma: POST_RECV qp_id={qp_id} mr_id={mr_id} len={effective_len}"
+            );
+            self.pending_recvs.push_back(wr);
+        }
+
+        self.match_send_recv(active_state);
+        RDMA_STATUS_OK
+    }
+
+    fn match_send_recv(&mut self, active_state: &ActiveState) {
+        while !self.pending_sends.is_empty() && !self.pending_recvs.is_empty() {
+            let send = self
+                .pending_sends
+                .pop_front()
+                .expect("pending_send missing");
+            let recv = self
+                .pending_recvs
+                .pop_front()
+                .expect("pending_recv missing");
+
+            let bytes = send.len.min(recv.len);
+            let mut status = RDMA_STATUS_OK;
+            if bytes > 0 && send.addr != 0 && recv.addr != 0 {
+                let mut buf = vec![0u8; bytes as usize];
+                if let Err(err) = active_state
+                    .mem
+                    .read_slice(&mut buf, GuestAddress(send.addr))
+                {
+                    error!("rdma: Failed to read send buffer: {err}");
+                    status = RDMA_STATUS_ERR;
+                } else if let Err(err) = active_state
+                    .mem
+                    .write_slice(&buf, GuestAddress(recv.addr))
+                {
+                    error!("rdma: Failed to write recv buffer: {err}");
+                    status = RDMA_STATUS_ERR;
+                }
+            }
+
+            if self.cq.len() >= (self.caps.max_wr as usize) * 2 {
+                error!("rdma: CQ overflow");
+                return;
+            }
+
+            self.cq.push_back(RdmaCqe {
+                wr_id: send.wr_id,
+                status,
+                bytes,
+                opcode: RDMA_OPCODE_POST_SEND,
+            });
+            if self.cq.len() >= (self.caps.max_wr as usize) * 2 {
+                error!("rdma: CQ overflow");
+                return;
+            }
+            self.cq.push_back(RdmaCqe {
+                wr_id: recv.wr_id,
+                status,
+                bytes,
+                opcode: RDMA_OPCODE_POST_RECV,
+            });
+        }
     }
 }
 
@@ -258,6 +526,21 @@ impl VirtioDevice for VirtioRdma {
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         Ok(())
     }
+
+    fn reset(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
+        let interrupt = self
+            .device_state
+            .active_state()
+            .map(|state| state.interrupt.clone());
+        self.device_state = DeviceState::Inactive;
+        self.acked_features = 0;
+        self.has_qp = false;
+        self.pending_sends.clear();
+        self.pending_recvs.clear();
+        self.cq.clear();
+        self.mrs.clear();
+        interrupt.map(|intr| (intr, Vec::new()))
+    }
 }
 
 #[cfg(test)]
@@ -288,13 +571,27 @@ mod tests {
         let req_addr = th.data_address() + 0x100;
         let resp_addr = th.data_address() + 0x200;
         let request = RdmaRequest {
+            addr: 0,
+            wr_id: 0,
             opcode: RDMA_OPCODE_CREATE_QP.to_le(),
             qp_id: 7u32.to_le(),
+            mr_id: 0,
+            len: 0,
+            flags: 0,
+            reserved: 0,
         };
         mem.write_obj(request, GuestAddress(req_addr)).unwrap();
         mem.write_obj(
             RdmaResponse {
+                wr_id: 0,
                 status: 0xdead_beef,
+                opcode: 0,
+                bytes: 0,
+                value0: 0,
+                value1: 0,
+                value2: 0,
+                value3: 0,
+                value4: 0,
             },
             GuestAddress(resp_addr),
         )
@@ -320,5 +617,68 @@ mod tests {
         assert_eq!(u32::from_le(response.status), RDMA_STATUS_OK);
 
         assert_eq!(th.device().queues[0].next_used.0, 1);
+    }
+
+    #[test]
+    fn test_rdma_query_caps() {
+        let mem = default_mem();
+        let device = VirtioRdma::new("rdma0".to_string()).unwrap();
+        let mut th = VirtioTestHelper::<VirtioRdma>::new(&mem, device);
+        th.activate_device(&mem);
+
+        let req_addr = th.data_address() + 0x300;
+        let resp_addr = th.data_address() + 0x400;
+        let request = RdmaRequest {
+            addr: 0,
+            wr_id: 0,
+            opcode: RDMA_OPCODE_QUERY_CAPS.to_le(),
+            qp_id: 0,
+            mr_id: 0,
+            len: 0,
+            flags: 0,
+            reserved: 0,
+        };
+        mem.write_obj(request, GuestAddress(req_addr)).unwrap();
+        mem.write_obj(
+            RdmaResponse {
+                wr_id: 0,
+                status: 0,
+                opcode: 0,
+                bytes: 0,
+                value0: 0,
+                value1: 0,
+                value2: 0,
+                value3: 0,
+                value4: 0,
+            },
+            GuestAddress(resp_addr),
+        )
+        .unwrap();
+
+        th.add_scatter_gather(
+            0,
+            0,
+            &[
+                (0, req_addr, size_of::<RdmaRequest>() as u32, 0),
+                (
+                    1,
+                    resp_addr,
+                    size_of::<RdmaResponse>() as u32,
+                    VIRTQ_DESC_F_WRITE,
+                ),
+            ],
+        );
+
+        th.emulate_for_msec(100).unwrap();
+
+        let response: RdmaResponse = mem.read_obj(GuestAddress(resp_addr)).unwrap();
+        assert_eq!(u32::from_le(response.status), RDMA_STATUS_OK);
+        assert_eq!(u32::from_le(response.opcode), RDMA_OPCODE_QUERY_CAPS);
+        assert_eq!(u32::from_le(response.value0), 1);
+        assert_eq!(u32::from_le(response.value1), 0);
+        assert_eq!(u32::from_le(response.value2), 1);
+        assert_eq!(u32::from_le(response.value3), 16);
+        assert_eq!(u32::from_le(response.bytes), 1);
+        assert_eq!(u32::from_le(response.value4), 128);
     }
 }

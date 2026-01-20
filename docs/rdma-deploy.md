@@ -75,3 +75,42 @@ ls -l /dev/virtio-rdma0
 /root/rdma_ctl loop-create-qp 1 100
 /root/rdma_ctl send-raw --opcode 0xdeadbeef --qp 1
 ```
+
+## M3 minimal loop (QUERY_CAPS/REGISTER_MR/POST_SEND/POST_RECV/POLL_CQ)
+
+```bash
+/root/rdma_ctl query-caps
+/root/rdma_ctl alloc-mr 4096 --pattern=inc
+/root/rdma_ctl alloc-mr 4096 --pattern=0xaa
+/root/rdma_ctl post-recv 1 2 256 100
+/root/rdma_ctl post-send 1 1 256 101
+/root/rdma_ctl poll-cq
+/root/rdma_ctl poll-cq
+/root/rdma_ctl dump-mr 2 0 64
+/root/rdma_ctl check-mr 2 0 256 --expect=inc
+```
+
+Expected:
+- `query-caps` prints version and limits.
+- `poll-cq` returns completions with `wr_id`, `bytes`, and `type`.
+
+## M4.2 stress (wrap-around and outstanding WRs)
+
+```bash
+/root/rdma_ctl stress --iters 100000 --outstanding 64
+```
+
+Expected:
+- No errors, no timeouts, no kernel warnings.
+
+## M4.3 lifecycle (destroy/deregister/reset)
+
+```bash
+/root/rdma_ctl deregister-mr 1
+/root/rdma_ctl deregister-mr 2
+/root/rdma_ctl destroy-qp 1
+```
+
+Expected:
+- Host log shows `DEREGISTER_MR` and `DESTROY_QP`.
+- Reloading the module works and creates a clean state.
