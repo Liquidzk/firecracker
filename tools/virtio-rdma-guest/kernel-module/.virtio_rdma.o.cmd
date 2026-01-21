@@ -1103,6 +1103,7 @@ deps_/home/liquid/dev-private/firecracker/tools/virtio-rdma-guest/kernel-module/
     $(wildcard include/config/HAVE_ARCH_HUGE_VMALLOC) \
   arch/x86/include/asm/vmalloc.h \
   arch/x86/include/asm/pgtable_areas.h \
+  include/linux/kfifo.h \
   include/linux/virtio.h \
   include/linux/mod_devicetable.h \
   include/linux/virtio_config.h \

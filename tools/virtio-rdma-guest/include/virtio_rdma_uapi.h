@@ -5,7 +5,12 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define VIRTIO_RDMA_IOCTL_CREATE_QP _IOW('R', 0x01, __u32)
+struct virtio_rdma_qp {
+	__u32 qp_id;
+	__u32 cq_id;
+};
+
+#define VIRTIO_RDMA_IOCTL_CREATE_QP _IOW('R', 0x01, struct virtio_rdma_qp)
 
 struct virtio_rdma_raw {
 	__u32 opcode;
@@ -44,6 +49,8 @@ struct virtio_rdma_cqe {
 	__u32 status;
 	__u32 bytes;
 	__u32 opcode;
+	__u32 qp_id;
+	__u32 cq_id;
 	__u32 reserved;
 };
 
@@ -52,6 +59,7 @@ struct virtio_rdma_cqe {
 #define VIRTIO_RDMA_IOCTL_POST_SEND _IOW('R', 0x05, struct virtio_rdma_wr)
 #define VIRTIO_RDMA_IOCTL_POST_RECV _IOW('R', 0x06, struct virtio_rdma_wr)
 #define VIRTIO_RDMA_IOCTL_POLL_CQ _IOR('R', 0x07, struct virtio_rdma_cqe)
+#define VIRTIO_RDMA_IOCTL_POLL_CQ_WAIT _IOR('R', 0x0c, struct virtio_rdma_cqe)
 
 struct virtio_rdma_mr_alloc {
 	__u32 len;

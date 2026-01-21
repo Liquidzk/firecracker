@@ -71,7 +71,7 @@ insmod /lib/modules/$(uname -r)/extra/virtio_rdma.ko
 dmesg | grep -i virtio-rdma
 ls -l /dev/virtio-rdma0
 
-/root/rdma_ctl create-qp 1
+/root/rdma_ctl create-qp 1 --cq 1
 /root/rdma_ctl loop-create-qp 1 100
 /root/rdma_ctl send-raw --opcode 0xdeadbeef --qp 1
 ```
@@ -92,7 +92,7 @@ ls -l /dev/virtio-rdma0
 
 Expected:
 - `query-caps` prints version and limits.
-- `poll-cq` returns completions with `wr_id`, `bytes`, and `type`.
+- `poll-cq` returns completions with `wr_id`, `bytes`, `type`, `qp_id`, and `cq_id`.
 
 ## M4.2 stress (wrap-around and outstanding WRs)
 
@@ -114,3 +114,15 @@ Expected:
 Expected:
 - Host log shows `DEREGISTER_MR` and `DESTROY_QP`.
 - Reloading the module works and creates a clean state.
+
+## M5 event-driven CQ (scheme B)
+
+`poll-cq --wait` blocks until a completion is available (no busy poll):
+
+```bash
+/root/rdma_ctl poll-cq --wait
+```
+
+Expected:
+- Blocks without high CPU usage.
+- Wakes when CQE arrives, returning `type=SEND`/`type=RECV`.

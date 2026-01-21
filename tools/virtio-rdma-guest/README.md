@@ -29,13 +29,14 @@ Load in guest
 ```
 insmod virtio_rdma.ko
 ./rdma_ctl query-caps
-./rdma_ctl create-qp 1
+./rdma_ctl create-qp 1 --cq 1
 ./rdma_ctl alloc-mr 4096 --pattern=inc
 ./rdma_ctl alloc-mr 4096 --pattern=0xaa
 ./rdma_ctl post-recv 1 2 256 100
 ./rdma_ctl post-send 1 1 256 101
 ./rdma_ctl poll-cq
 ./rdma_ctl poll-cq
+./rdma_ctl poll-cq --wait
 ./rdma_ctl dump-mr 2 0 64
 ./rdma_ctl check-mr 2 0 256 --expect=inc
 ./rdma_ctl stress --iters 100000 --outstanding 64

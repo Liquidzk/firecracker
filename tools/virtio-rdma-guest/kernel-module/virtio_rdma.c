@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/uaccess.h>
+#include <linux/kfifo.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_ring.h>
@@ -39,7 +40,10 @@
 #define RDMA_STATUS_EMPTY 2
 
 #define RDMA_MAX_MR 16
+#define RDMA_MAX_QP 8
 #define RDMA_MAX_MR_LEN (1U << 20)
+#define RDMA_CQ_BUFFERS 128
+#define RDMA_CQ_FIFO_ENTRIES 4096
 
 struct virtio_rdma_req {
 	__le64 addr;
@@ -76,6 +80,8 @@ struct virtio_rdma_mr_entry {
 struct virtio_rdma_dev {
 	struct virtio_device *vdev;
 	struct virtqueue *ctrl_vq;
+	struct virtqueue *data_vq;
+	struct virtqueue *cq_vq;
 	struct miscdevice miscdev;
 	struct mutex ioctl_lock;
 	struct completion ctrl_done;
@@ -88,7 +94,13 @@ struct virtio_rdma_dev {
 	bool timed_out;
 	struct virtio_rdma_mr_entry mrs[RDMA_MAX_MR];
 	unsigned int mr_count;
-	bool qp_created;
+	u32 qps[RDMA_MAX_QP];
+	unsigned int qp_count;
+	struct virtio_rdma_cqe *cq_bufs;
+	unsigned int cq_buf_count;
+	struct kfifo cq_fifo;
+	spinlock_t cq_lock;
+	wait_queue_head_t cq_wait;
 };
 
 static unsigned int ctrl_timeout_ms = 1000;
@@ -115,6 +127,46 @@ static void virtio_rdma_ctrl_cb(struct virtqueue *vq)
 		}
 		complete(&vrdev->ctrl_done);
 	}
+}
+
+static void virtio_rdma_cq_cb(struct virtqueue *vq)
+{
+	struct virtio_rdma_dev *vrdev = vq->vdev->priv;
+	unsigned int len;
+	void *buf;
+	unsigned long flags;
+
+	while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
+		if (len < sizeof(struct virtio_rdma_cqe))
+			continue;
+		spin_lock_irqsave(&vrdev->cq_lock, flags);
+		if (kfifo_avail(&vrdev->cq_fifo) >=
+		    sizeof(struct virtio_rdma_cqe)) {
+			kfifo_in(&vrdev->cq_fifo, buf,
+				 sizeof(struct virtio_rdma_cqe));
+		} else {
+			dev_warn(&vrdev->vdev->dev,
+				 "virtio-rdma: cq fifo overflow\n");
+		}
+		spin_unlock_irqrestore(&vrdev->cq_lock, flags);
+		wake_up_interruptible(&vrdev->cq_wait);
+
+		/* Requeue buffer for future CQEs. */
+		{
+			struct scatterlist sg;
+			int ret;
+
+			sg_init_one(&sg, buf, sizeof(struct virtio_rdma_cqe));
+			ret = virtqueue_add_inbuf(vrdev->cq_vq, &sg, 1, buf,
+						  GFP_ATOMIC);
+			if (ret)
+				dev_warn(&vrdev->vdev->dev,
+					 "virtio-rdma: requeue cq buf failed: %d\n",
+					 ret);
+		}
+	}
+
+	virtqueue_kick(vrdev->cq_vq);
 }
 
 static void virtio_rdma_free_buffers(struct virtio_rdma_dev *vrdev)
@@ -165,6 +217,7 @@ static void virtio_rdma_fill_pattern(
 }
 
 static int virtio_rdma_submit(struct virtio_rdma_dev *vrdev,
+			      struct virtqueue *vq,
 			      const struct virtio_rdma_req *req,
 			      struct virtio_rdma_resp *resp,
 			      size_t req_len, bool map_invalid,
@@ -194,19 +247,18 @@ static int virtio_rdma_submit(struct virtio_rdma_dev *vrdev,
 	sgs[0] = &sg_req;
 	sgs[1] = &sg_resp;
 
-	ret = virtqueue_add_sgs(vrdev->ctrl_vq, sgs, 1, 1, vrdev->req,
-				GFP_KERNEL);
+	ret = virtqueue_add_sgs(vq, sgs, 1, 1, vrdev->req, GFP_KERNEL);
 	if (ret) {
 		ret = -EIO;
 		goto out_inflight;
 	}
 
-	virtqueue_kick(vrdev->ctrl_vq);
+	virtqueue_kick(vq);
 
 	timeout = wait_for_completion_timeout(&vrdev->ctrl_done,
 					      msecs_to_jiffies(ctrl_timeout_ms));
 	if (!timeout) {
-		void *unused = virtqueue_detach_unused_buf(vrdev->ctrl_vq);
+		void *unused = virtqueue_detach_unused_buf(vq);
 
 		if (unused) {
 			vrdev->inflight = false;
@@ -274,11 +326,26 @@ static int virtio_rdma_remove_mr(struct virtio_rdma_dev *vrdev, u32 mr_id)
 	return -EINVAL;
 }
 
+static int virtio_rdma_remove_qp(struct virtio_rdma_dev *vrdev, u32 qp_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < vrdev->qp_count; i++) {
+		if (vrdev->qps[i] == qp_id) {
+			vrdev->qps[i] = vrdev->qps[vrdev->qp_count - 1];
+			vrdev->qp_count--;
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
 static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 			      unsigned long arg)
 {
 	struct virtio_rdma_dev *vrdev = file->private_data;
 	struct virtio_rdma_raw raw = { 0 };
+	struct virtio_rdma_qp qp = { 0 };
 	struct virtio_rdma_caps caps = { 0 };
 	struct virtio_rdma_mr mr = { 0 };
 	struct virtio_rdma_mr_alloc mr_alloc = { 0 };
@@ -290,10 +357,11 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 	struct virtio_rdma_mr_entry *entry;
 	u32 qp_id;
 	int ret;
+	unsigned long flags;
 
 	switch (cmd) {
 	case VIRTIO_RDMA_IOCTL_CREATE_QP:
-		if (copy_from_user(&qp_id, (void __user *)arg, sizeof(qp_id)))
+		if (copy_from_user(&qp, (void __user *)arg, sizeof(qp)))
 			return -EFAULT;
 		break;
 	case VIRTIO_RDMA_IOCTL_SEND_RAW:
@@ -302,6 +370,7 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case VIRTIO_RDMA_IOCTL_QUERY_CAPS:
 	case VIRTIO_RDMA_IOCTL_POLL_CQ:
+	case VIRTIO_RDMA_IOCTL_POLL_CQ_WAIT:
 		break;
 	case VIRTIO_RDMA_IOCTL_REGISTER_MR:
 		if (copy_from_user(&mr, (void __user *)arg, sizeof(mr)))
@@ -342,6 +411,32 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 	if (cmd == VIRTIO_RDMA_IOCTL_SEND_RAW)
 		qp_id = raw.qp_id;
 
+	if (cmd == VIRTIO_RDMA_IOCTL_POLL_CQ ||
+	    cmd == VIRTIO_RDMA_IOCTL_POLL_CQ_WAIT) {
+		if (cmd == VIRTIO_RDMA_IOCTL_POLL_CQ_WAIT) {
+			int wret = wait_event_interruptible(
+				vrdev->cq_wait,
+				!kfifo_is_empty(&vrdev->cq_fifo));
+			if (wret)
+				return wret;
+		}
+
+		spin_lock_irqsave(&vrdev->cq_lock, flags);
+		if (kfifo_len(&vrdev->cq_fifo) <
+		    sizeof(struct virtio_rdma_cqe)) {
+			spin_unlock_irqrestore(&vrdev->cq_lock, flags);
+			return -EAGAIN;
+		}
+		kfifo_out(&vrdev->cq_fifo, &cqe,
+			  sizeof(struct virtio_rdma_cqe));
+		spin_unlock_irqrestore(&vrdev->cq_lock, flags);
+
+		if (copy_to_user((void __user *)arg, &cqe, sizeof(cqe)))
+			return -EFAULT;
+
+		return 0;
+	}
+
 	mutex_lock(&vrdev->ioctl_lock);
 	if (vrdev->inflight) {
 		mutex_unlock(&vrdev->ioctl_lock);
@@ -350,21 +445,34 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 
 	if (cmd == VIRTIO_RDMA_IOCTL_CREATE_QP) {
 		req.opcode = cpu_to_le32(RDMA_OPCODE_CREATE_QP);
-		req.qp_id = cpu_to_le32(qp_id);
-		ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req), false,
-					 false);
-		if (ret == 0)
-			vrdev->qp_created = true;
+		req.qp_id = cpu_to_le32(qp.qp_id);
+		req.flags = cpu_to_le32(qp.cq_id);
+		ret = virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req, &resp,
+					 sizeof(req), false, false);
+		if (ret == 0 && le32_to_cpu(resp.status) == RDMA_STATUS_OK) {
+			bool exists = false;
+			unsigned int i;
+
+			for (i = 0; i < vrdev->qp_count; i++) {
+				if (vrdev->qps[i] == qp.qp_id) {
+					exists = true;
+					break;
+				}
+			}
+			if (!exists && vrdev->qp_count < RDMA_MAX_QP)
+				vrdev->qps[vrdev->qp_count++] = qp.qp_id;
+		}
 		dev_info(&vrdev->vdev->dev,
-			 "virtio-rdma: CREATE_QP qp_id=%u -> status=%u\n",
-			 qp_id, le32_to_cpu(resp.status));
+			 "virtio-rdma: CREATE_QP qp_id=%u cq_id=%u -> status=%u\n",
+			 qp.qp_id, qp.cq_id, le32_to_cpu(resp.status));
 	} else {
 		switch (cmd) {
 		case VIRTIO_RDMA_IOCTL_SEND_RAW:
 			req.opcode = cpu_to_le32(raw.opcode);
 			req.qp_id = cpu_to_le32(raw.qp_id);
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 true, false);
+			ret = virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req,
+						 &resp, sizeof(req), true,
+						 false);
 			dev_info(&vrdev->vdev->dev,
 				 "virtio-rdma: RAW opcode=0x%x qp_id=%u -> status=%u\n",
 				 raw.opcode, raw.qp_id,
@@ -372,8 +480,9 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 			break;
 		case VIRTIO_RDMA_IOCTL_QUERY_CAPS:
 			req.opcode = cpu_to_le32(RDMA_OPCODE_QUERY_CAPS);
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 false, false);
+			ret = virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req,
+						 &resp, sizeof(req), false,
+						 false);
 			if (!ret) {
 				caps.version_major = le32_to_cpu(resp.value0);
 				caps.version_minor = le32_to_cpu(resp.value1);
@@ -408,8 +517,9 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 			req.addr = cpu_to_le64(entry->addr);
 			req.len = cpu_to_le32(entry->len);
 			req.mr_id = 0;
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 false, false);
+			ret = virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req,
+						 &resp, sizeof(req), false,
+						 false);
 			if (ret) {
 				kfree(entry->kaddr);
 				break;
@@ -432,8 +542,9 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 		case VIRTIO_RDMA_IOCTL_DEREGISTER_MR:
 			req.opcode = cpu_to_le32(RDMA_OPCODE_DEREGISTER_MR);
 			req.mr_id = cpu_to_le32(qp_id);
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 false, true);
+			ret = virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req,
+						 &resp, sizeof(req), false,
+						 true);
 			if (!ret) {
 				if (le32_to_cpu(resp.status) != RDMA_STATUS_OK) {
 					ret = -EIO;
@@ -449,14 +560,15 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 		case VIRTIO_RDMA_IOCTL_DESTROY_QP:
 			req.opcode = cpu_to_le32(RDMA_OPCODE_DESTROY_QP);
 			req.qp_id = cpu_to_le32(qp_id);
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 false, true);
+			ret = virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req,
+						 &resp, sizeof(req), false,
+						 true);
 			if (!ret) {
 				if (le32_to_cpu(resp.status) != RDMA_STATUS_OK) {
 					ret = -EIO;
 					break;
 				}
-				vrdev->qp_created = false;
+				virtio_rdma_remove_qp(vrdev, qp_id);
 				dev_info(&vrdev->vdev->dev,
 					 "virtio-rdma: DESTROY_QP qp_id=%u\n",
 					 qp_id);
@@ -491,8 +603,9 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 			req.addr = cpu_to_le64(entry->addr);
 			req.len = cpu_to_le32(entry->len);
 			req.mr_id = 0;
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 false, false);
+			ret = virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req,
+						 &resp, sizeof(req), false,
+						 false);
 			if (ret) {
 				kfree(entry->kaddr);
 				break;
@@ -552,8 +665,9 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 			req.addr = cpu_to_le64(entry->addr);
 			req.len = cpu_to_le32(wr.len);
 			req.wr_id = cpu_to_le64(wr.wr_id);
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 false, false);
+			ret = virtio_rdma_submit(vrdev, vrdev->data_vq, &req,
+						 &resp, sizeof(req), false,
+						 false);
 			if (!ret) {
 				dev_info(&vrdev->vdev->dev,
 					 "virtio-rdma: %s qp_id=%u mr_id=%u wr_id=%llu len=%u\n",
@@ -562,29 +676,6 @@ static long virtio_rdma_ioctl(struct file *file, unsigned int cmd,
 						 "POST_RECV",
 					 wr.qp_id, wr.mr_id,
 					 (unsigned long long)wr.wr_id, wr.len);
-			}
-			break;
-		case VIRTIO_RDMA_IOCTL_POLL_CQ:
-			req.opcode = cpu_to_le32(RDMA_OPCODE_POLL_CQ);
-			ret = virtio_rdma_submit(vrdev, &req, &resp, sizeof(req),
-						 false, true);
-			if (!ret) {
-				if (le32_to_cpu(resp.status) ==
-				    RDMA_STATUS_EMPTY) {
-					ret = -EAGAIN;
-					break;
-				}
-				if (le32_to_cpu(resp.status) != RDMA_STATUS_OK) {
-					ret = -EIO;
-					break;
-				}
-				cqe.wr_id = le64_to_cpu(resp.wr_id);
-				cqe.status = le32_to_cpu(resp.status);
-				cqe.bytes = le32_to_cpu(resp.bytes);
-				cqe.opcode = le32_to_cpu(resp.opcode);
-				if (copy_to_user((void __user *)arg, &cqe,
-						 sizeof(cqe)))
-					ret = -EFAULT;
 			}
 			break;
 		default:
@@ -613,24 +704,28 @@ static int virtio_rdma_release(struct inode *inode, struct file *file)
 	unsigned int i;
 	struct virtio_rdma_req req = { 0 };
 	struct virtio_rdma_resp resp = { 0 };
+	unsigned long flags;
 
 	mutex_lock(&vrdev->ioctl_lock);
+	spin_lock_irqsave(&vrdev->cq_lock, flags);
+	kfifo_reset(&vrdev->cq_fifo);
+	spin_unlock_irqrestore(&vrdev->cq_lock, flags);
 	for (i = 0; i < vrdev->mr_count; i++) {
 		req.opcode = cpu_to_le32(RDMA_OPCODE_DEREGISTER_MR);
 		req.mr_id = cpu_to_le32(vrdev->mrs[i].id);
-		virtio_rdma_submit(vrdev, &req, &resp, sizeof(req), false,
-				   true);
+		virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req, &resp,
+				   sizeof(req), false, true);
 		kfree(vrdev->mrs[i].kaddr);
 	}
 	vrdev->mr_count = 0;
 
-	if (vrdev->qp_created) {
+	for (i = 0; i < vrdev->qp_count; i++) {
 		req.opcode = cpu_to_le32(RDMA_OPCODE_DESTROY_QP);
-		req.qp_id = cpu_to_le32(0);
-		virtio_rdma_submit(vrdev, &req, &resp, sizeof(req), false,
-				   true);
-		vrdev->qp_created = false;
+		req.qp_id = cpu_to_le32(vrdev->qps[i]);
+		virtio_rdma_submit(vrdev, vrdev->ctrl_vq, &req, &resp,
+				   sizeof(req), false, true);
 	}
+	vrdev->qp_count = 0;
 	mutex_unlock(&vrdev->ioctl_lock);
 	return 0;
 }
@@ -649,9 +744,14 @@ static const struct file_operations virtio_rdma_fops = {
 static int virtio_rdma_probe(struct virtio_device *vdev)
 {
 	struct virtio_rdma_dev *vrdev;
-	struct virtqueue *vqs[1];
-	vq_callback_t *cbs[1] = { virtio_rdma_ctrl_cb };
-	const char *names[1] = { "ctrl" };
+	struct virtqueue *vqs[3];
+	vq_callback_t *cbs[3] = {
+		virtio_rdma_ctrl_cb,
+		virtio_rdma_ctrl_cb,
+		virtio_rdma_cq_cb,
+	};
+	const char *names[3] = { "ctrl", "data", "cq" };
+	struct scatterlist sg;
 	int ret;
 
 	vrdev = devm_kzalloc(&vdev->dev, sizeof(*vrdev), GFP_KERNEL);
@@ -662,14 +762,58 @@ static int virtio_rdma_probe(struct virtio_device *vdev)
 	vrdev->vdev = vdev;
 	mutex_init(&vrdev->ioctl_lock);
 	init_completion(&vrdev->ctrl_done);
+	spin_lock_init(&vrdev->cq_lock);
+	init_waitqueue_head(&vrdev->cq_wait);
 
-	ret = virtio_find_vqs(vdev, 1, vqs, cbs, names, NULL);
+	ret = virtio_find_vqs(vdev, 3, vqs, cbs, names, NULL);
 	if (ret) {
 		dev_err(&vdev->dev, "virtio-rdma: failed to find vq: %d\n", ret);
 		return ret;
 	}
 
 	vrdev->ctrl_vq = vqs[0];
+	vrdev->data_vq = vqs[1];
+	vrdev->cq_vq = vqs[2];
+
+	ret = kfifo_alloc(&vrdev->cq_fifo,
+			  RDMA_CQ_FIFO_ENTRIES *
+				  sizeof(struct virtio_rdma_cqe),
+			  GFP_KERNEL);
+	if (ret) {
+		dev_err(&vdev->dev, "virtio-rdma: kfifo_alloc failed: %d\n",
+			ret);
+		vdev->config->del_vqs(vdev);
+		return ret;
+	}
+
+	vrdev->cq_buf_count = min_t(unsigned int,
+				    virtqueue_get_vring_size(vrdev->cq_vq),
+				    RDMA_CQ_BUFFERS);
+	vrdev->cq_bufs =
+		devm_kcalloc(&vdev->dev, vrdev->cq_buf_count,
+			     sizeof(*vrdev->cq_bufs), GFP_KERNEL);
+	if (!vrdev->cq_bufs) {
+		kfifo_free(&vrdev->cq_fifo);
+		vdev->config->del_vqs(vdev);
+		return -ENOMEM;
+	}
+
+	{
+		unsigned int i;
+
+		for (i = 0; i < vrdev->cq_buf_count; i++) {
+			sg_init_one(&sg, &vrdev->cq_bufs[i],
+				    sizeof(struct virtio_rdma_cqe));
+			ret = virtqueue_add_inbuf(vrdev->cq_vq, &sg, 1,
+						  &vrdev->cq_bufs[i], GFP_KERNEL);
+			if (ret) {
+				dev_err(&vdev->dev,
+					"virtio-rdma: add cq buf failed: %d\n", ret);
+				break;
+			}
+		}
+	}
+	virtqueue_kick(vrdev->cq_vq);
 	vrdev->miscdev.minor = MISC_DYNAMIC_MINOR;
 	vrdev->miscdev.name = "virtio-rdma0";
 	vrdev->miscdev.fops = &virtio_rdma_fops;
@@ -697,6 +841,7 @@ static void virtio_rdma_remove(struct virtio_device *vdev)
 
 	dev_info(&vdev->dev, "virtio-rdma: removed\n");
 	virtio_rdma_free_mrs(vrdev);
+	kfifo_free(&vrdev->cq_fifo);
 	misc_deregister(&vrdev->miscdev);
 	vdev->config->reset(vdev);
 	vdev->config->del_vqs(vdev);

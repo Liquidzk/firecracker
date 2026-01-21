@@ -4,21 +4,37 @@
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
-use super::{RDMA_QUEUE, VirtioRdma};
+use super::{RDMA_CQ_QUEUE, RDMA_CTRL_QUEUE, RDMA_DATA_QUEUE, VirtioRdma};
 use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{error, warn};
 
 impl VirtioRdma {
     const PROCESS_ACTIVATE: u32 = 0;
-    const PROCESS_RDMA_QUEUE: u32 = 1;
+    const PROCESS_CTRL_QUEUE: u32 = 1;
+    const PROCESS_DATA_QUEUE: u32 = 2;
+    const PROCESS_CQ_QUEUE: u32 = 3;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
-            &self.queue_events()[RDMA_QUEUE],
-            Self::PROCESS_RDMA_QUEUE,
+            &self.queue_events()[RDMA_CTRL_QUEUE],
+            Self::PROCESS_CTRL_QUEUE,
             EventSet::IN,
         )) {
-            error!("rdma: Failed to register queue event: {err}");
+            error!("rdma: Failed to register ctrl queue event: {err}");
+        }
+        if let Err(err) = ops.add(Events::with_data(
+            &self.queue_events()[RDMA_DATA_QUEUE],
+            Self::PROCESS_DATA_QUEUE,
+            EventSet::IN,
+        )) {
+            error!("rdma: Failed to register data queue event: {err}");
+        }
+        if let Err(err) = ops.add(Events::with_data(
+            &self.queue_events()[RDMA_CQ_QUEUE],
+            Self::PROCESS_CQ_QUEUE,
+            EventSet::IN,
+        )) {
+            error!("rdma: Failed to register cq queue event: {err}");
         }
     }
 
@@ -75,7 +91,9 @@ impl MutEventSubscriber for VirtioRdma {
 
         match source {
             Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
-            Self::PROCESS_RDMA_QUEUE => self.process_queue_event(),
+            Self::PROCESS_CTRL_QUEUE => self.process_ctrl_queue_event(),
+            Self::PROCESS_DATA_QUEUE => self.process_data_queue_event(),
+            Self::PROCESS_CQ_QUEUE => self.process_cq_queue_event(),
             _ => {
                 warn!("rdma: Unknown event received: {source}");
             }

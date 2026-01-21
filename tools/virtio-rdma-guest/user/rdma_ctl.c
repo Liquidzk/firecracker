@@ -14,7 +14,7 @@ static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"Usage:\n"
-		"  %s create-qp <qp_id>\n"
+		"  %s create-qp <qp_id> [--cq <cq_id>]\n"
 		"  %s loop-create-qp <start> <count>\n"
 		"  %s query-caps\n"
 		"  %s register-mr <len>\n"
@@ -26,7 +26,7 @@ static void usage(const char *prog)
 		"  %s stress --iters <n> --outstanding <n>\n"
 		"  %s post-send <qp_id> <mr_id> <len> <wr_id>\n"
 		"  %s post-recv <qp_id> <mr_id> <len> <wr_id>\n"
-		"  %s poll-cq\n"
+		"  %s poll-cq [--wait]\n"
 		"  %s send-raw --opcode <hex> --qp <id> [--truncate]\n",
 		prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
 		prog, prog, prog, prog);
@@ -174,6 +174,7 @@ static void dump_hex(const uint8_t *buf, uint32_t offset, uint32_t len)
 int main(int argc, char **argv)
 {
 	struct virtio_rdma_raw raw;
+	struct virtio_rdma_qp qp;
 	struct virtio_rdma_caps caps;
 	struct virtio_rdma_mr mr;
 	struct virtio_rdma_mr_alloc mr_alloc;
@@ -197,13 +198,25 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (strcmp(argv[1], "create-qp") == 0 && argc == 3) {
+	if (strcmp(argv[1], "create-qp") == 0 &&
+	    (argc == 3 || argc == 5)) {
+		memset(&qp, 0, sizeof(qp));
 		if (parse_u32(argv[2], &qp_id) != 0) {
 			fprintf(stderr, "Invalid qp_id: %s\n", argv[2]);
 			close(fd);
 			return 1;
 		}
-		ret = do_ioctl(fd, VIRTIO_RDMA_IOCTL_CREATE_QP, &qp_id);
+		qp.qp_id = qp_id;
+		if (argc == 5) {
+			if (strcmp(argv[3], "--cq") != 0 ||
+			    parse_u32(argv[4], &qp.cq_id) != 0) {
+				fprintf(stderr, "Invalid cq_id: %s\n",
+					argv[4]);
+				close(fd);
+				return 1;
+			}
+		}
+		ret = do_ioctl(fd, VIRTIO_RDMA_IOCTL_CREATE_QP, &qp);
 		if (ret == 0)
 			printf("OK\n");
 		close(fd);
@@ -227,7 +240,9 @@ int main(int argc, char **argv)
 
 		for (uint32_t i = 0; i < count; i++) {
 			qp_id = start + i;
-			ret = do_ioctl(fd, VIRTIO_RDMA_IOCTL_CREATE_QP, &qp_id);
+			memset(&qp, 0, sizeof(qp));
+			qp.qp_id = qp_id;
+			ret = do_ioctl(fd, VIRTIO_RDMA_IOCTL_CREATE_QP, &qp);
 			if (ret != 0) {
 				fprintf(stderr, "Failed at qp_id=%u\n", qp_id);
 				close(fd);
@@ -436,7 +451,9 @@ int main(int argc, char **argv)
 		}
 
 		qp_id = 1;
-		ret = do_ioctl(fd, VIRTIO_RDMA_IOCTL_CREATE_QP, &qp_id);
+		memset(&qp, 0, sizeof(qp));
+		qp.qp_id = qp_id;
+		ret = do_ioctl(fd, VIRTIO_RDMA_IOCTL_CREATE_QP, &qp);
 		if (ret != 0) {
 			close(fd);
 			return 1;
@@ -474,7 +491,7 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			for (uint32_t i = 0; i < outstanding; i++) {
-				wr.qp_id = 1;
+				wr.qp_id = qp_id;
 				wr.mr_id = recv_mr;
 				wr.len = len;
 				wr.wr_id = recv_base | i;
@@ -491,7 +508,7 @@ int main(int argc, char **argv)
 			}
 
 			for (uint32_t i = 0; i < outstanding; i++) {
-				wr.qp_id = 1;
+				wr.qp_id = qp_id;
 				wr.mr_id = send_mr;
 				wr.len = len;
 				wr.wr_id = send_base | i;
@@ -521,11 +538,13 @@ int main(int argc, char **argv)
 					close(fd);
 					return 1;
 				}
-				if (cqe.status != 0 || cqe.bytes != len) {
+				if (cqe.status != 0 || cqe.bytes != len ||
+				    cqe.qp_id != qp_id) {
 					fprintf(stderr,
-						"bad cqe: wr_id=%llu status=%u bytes=%u\n",
+						"bad cqe: wr_id=%llu status=%u bytes=%u qp_id=%u\n",
 						(unsigned long long)cqe.wr_id,
-						cqe.status, cqe.bytes);
+						cqe.status, cqe.bytes,
+						cqe.qp_id);
 					free(seen);
 					close(fd);
 					return 1;
@@ -619,9 +638,15 @@ int main(int argc, char **argv)
 		return ret == 0 ? 0 : 1;
 	}
 
-	if (strcmp(argv[1], "poll-cq") == 0 && argc == 2) {
+	if (strcmp(argv[1], "poll-cq") == 0 &&
+	    (argc == 2 || (argc == 3 && strcmp(argv[2], "--wait") == 0))) {
+		int wait = (argc == 3);
+
 		memset(&cqe, 0, sizeof(cqe));
-		ret = ioctl(fd, VIRTIO_RDMA_IOCTL_POLL_CQ, &cqe);
+		ret = ioctl(fd,
+			    wait ? VIRTIO_RDMA_IOCTL_POLL_CQ_WAIT :
+					   VIRTIO_RDMA_IOCTL_POLL_CQ,
+			    &cqe);
 		if (ret < 0) {
 			if (errno == EAGAIN) {
 				printf("EMPTY\n");
@@ -632,9 +657,9 @@ int main(int argc, char **argv)
 			close(fd);
 			return 1;
 		}
-		printf("wr_id=%llu status=%u bytes=%u type=%s\n",
+		printf("wr_id=%llu status=%u bytes=%u type=%s qp_id=%u cq_id=%u\n",
 		       (unsigned long long)cqe.wr_id, cqe.status, cqe.bytes,
-		       opcode_name(cqe.opcode));
+		       opcode_name(cqe.opcode), cqe.qp_id, cqe.cq_id);
 		close(fd);
 		return 0;
 	}

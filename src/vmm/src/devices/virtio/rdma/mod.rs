@@ -6,5 +6,7 @@ mod event_handler;
 
 pub use self::device::{RdmaError, VirtioRdma};
 
-pub(crate) const RDMA_NUM_QUEUES: usize = 1;
-pub(crate) const RDMA_QUEUE: usize = 0;
+pub(crate) const RDMA_NUM_QUEUES: usize = 3;
+pub(crate) const RDMA_CTRL_QUEUE: usize = 0;
+pub(crate) const RDMA_DATA_QUEUE: usize = 1;
+pub(crate) const RDMA_CQ_QUEUE: usize = 2;
